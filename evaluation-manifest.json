@@ -1,0 +1,16 @@
+{
+  "dataset": "quote_requests_sample.csv",
+  "dataset_sha256": "a26c58045e1fa947e582bb850359f80a7baa5eeb4f6ecb092b7e413ad33a193d",
+  "seed": 137,
+  "model": "gpt-5-mini",
+  "request_count": 20,
+  "metrics": {
+    "total_requests": 20,
+    "fully_fulfilled": 3,
+    "partially_fulfilled": 14,
+    "rejected": 3,
+    "requests_with_cash_change": 16,
+    "customer_data_leaks": 0,
+    "negative_inventory_items": 0
+  }
+}
