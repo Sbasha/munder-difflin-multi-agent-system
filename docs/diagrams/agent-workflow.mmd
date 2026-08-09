@@ -1,0 +1,74 @@
+---
+title: Munder Difflin agent workflow
+---
+%%{init: {"flowchart": {"nodeSpacing": 45, "rankSpacing": 50, "curve": "basis"}}}%%
+flowchart TB
+    subgraph user["CUSTOMER"]
+        request["Customer request<br>items · quantities · deadline"]:::inputOutput
+    end
+
+    subgraph system["MULTI-AGENT SYSTEM"]
+        subgraph orchestration["ORCHESTRATION"]
+            orchestrator["<b>1 · Orchestrator Agent</b><br>Interprets the request, delegates the work,<br>and composes the customer response"]:::llm
+            orchestrator_tools["<b>Orchestrator tools</b><br><br><b>resolve_catalog_items</b> · catalog matching<br><i>aliases · units · fuzzy threshold</i><br><br><b>financial_health_report</b> · internal check<br><i>generate_financial_report</i>"]:::tool
+            orchestrator --> orchestrator_tools
+        end
+
+        subgraph workers["WORKER AGENTS & TOOLS"]
+            inventory["<b>2 · Inventory Agent</b><br>Assesses stock and supplier feasibility;<br>places cash-guarded restocks"]:::agent
+            quoting["<b>3 · Quoting Agent</b><br>Prices with volume discounts<br>and explains the rationale"]:::agent
+            fulfillment["<b>4 · Fulfillment Agent</b><br>Revalidates stock<br>and records the sale"]:::agent
+
+            inventory_tools["<b>Inventory tools</b><br><br><b>inventory_snapshot</b> · dated stock view<br><i>get_all_inventory</i><br><br><b>assess_availability</b> · stock and supplier timing<br><i>get_stock_level</i><br><i>get_supplier_delivery_date</i><br><br><b>place_restock_order</b> · cash-guarded restock<br><i>get_cash_balance</i><br><i>create_transaction · stock orders</i>"]:::tool
+            quoting_tools["<b>Quoting tools</b><br><br><b>retrieve_comparable_quotes</b> · historical context<br><i>search_quote_history</i><br><br><b>compute_quote</b> · markup and volume tiers,<br>never below cost"]:::tool
+            fulfillment_tools["<b>Fulfillment tool</b><br><br><b>commit_sale</b> · revalidate, then record<br><i>get_stock_level</i><br><i>create_transaction · sales</i>"]:::tool
+
+            inventory --> inventory_tools
+            quoting --> quoting_tools
+            fulfillment --> fulfillment_tools
+        end
+
+        subgraph outcomes["OUTCOMES"]
+            decision{"Order<br>outcome"}:::decision
+            full["FULL<br>all lines supplied"]:::success
+            partial["PARTIAL<br>declined lines explained"]:::warning
+            rejected["REJECTED<br>reason provided"]:::error
+            response["Orchestrator composes the<br>customer-safe response"]:::llm
+            decision --> full --> response
+            decision --> partial --> response
+            decision --> rejected --> response
+        end
+
+        subgraph data["DATA LAYER"]
+            ledger[("SQLite transaction ledger<br>inventory · quote history · stock orders · sales")]:::storage
+        end
+    end
+
+    request -->|"1 · Send request"| orchestrator
+    orchestrator -->|"2 · Resolved lines"| inventory
+    orchestrator -->|"3 · Deliverable lines"| quoting
+    orchestrator -->|"4 · Priced lines"| fulfillment
+    fulfillment -->|"5 · Fulfillment result"| decision
+    response -->|"6 · Customer response"| request
+
+    orchestrator_tools --> ledger
+    inventory_tools --> ledger
+    quoting_tools --> ledger
+    fulfillment_tools --> ledger
+
+    style user fill:#F8FAFC,stroke:#9AA5B1,color:#3E4C59
+    style system fill:#FFFFFF,stroke:#7B8794,color:#3E4C59
+    style orchestration fill:#EEF2FF,stroke:#A5B4FC,color:#315EFB
+    style workers fill:#F8FAFC,stroke:#CBD2D9,color:#3E4C59
+    style outcomes fill:#F8FAFC,stroke:#CBD2D9,color:#3E4C59
+    style data fill:#FFF7ED,stroke:#FDBA74,color:#C2410C
+
+    classDef inputOutput fill:#F5F5F5,stroke:#9E9E9E,color:#424242
+    classDef llm fill:#EEF2FF,stroke:#315EFB,color:#315EFB
+    classDef agent fill:#ECFDF5,stroke:#0F766E,color:#0F766E
+    classDef storage fill:#FFF7ED,stroke:#C2410C,color:#C2410C
+    classDef tool fill:#FFFFFF,stroke:#CBD2D9,color:#17202A
+    classDef decision fill:#FFFBEB,stroke:#B45309,color:#B45309
+    classDef success fill:#F0FDF4,stroke:#15803D,color:#15803D
+    classDef warning fill:#FFFBEB,stroke:#B45309,color:#B45309
+    classDef error fill:#FEF2F2,stroke:#B91C1C,color:#B91C1C
