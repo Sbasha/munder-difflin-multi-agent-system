@@ -7,12 +7,15 @@ orders. It prioritizes correctness and recoverability before adding more autonom
 
 The repository already provides:
 
-- four Pydantic AI agents (orchestrator, inventory, quoting, fulfillment) over deterministic
-  tools;
+- five Pydantic AI agents (orchestrator, inventory, quoting, fulfillment, business advisor) over
+  deterministic tools;
 - typed contracts for every agent handoff and tool result;
 - deterministic catalog, pricing, inventory, and safety policies;
-- structured trace events;
-- executable evaluation gates; and
+- structured trace events that stream live to the terminal;
+- executable evaluation gates;
+- a bounded customer negotiation simulator (`munder-difflin negotiate`) as an evaluation
+  layer;
+- a business advisor agent (`munder-difflin advise`) for post-run operational analysis; and
 - a customer-safe response projection with a leak guard.
 
 These controls make the simulation inspectable, but they do not make SQLite, file-based input, or
@@ -24,16 +27,12 @@ The following were considered during development and deliberately left out of th
 system because no correctness need justified their complexity. They remain the first candidates
 for the phases below:
 
-- **Business advisor agent.** A fifth, read-only agent that analyzes the transaction ledger and
-  recommends operational changes. It belongs in Phase 7 once evaluation and governance exist.
 - **Request-level idempotency and replay cache.** Safe replays of duplicate requests matter for a
   real API surface (Phase 1); the batch evaluation resets its database per run and never
   resubmits, so the cache earned nothing in the classroom system.
 - **Row-level transaction dedupe and atomic multi-line commits.** The current system commits
   line by line with a pre-commit stock revalidation, which is honest for a single-threaded
   simulation. Real concurrency requires the Phase 1 state machine plus database constraints.
-- **Customer negotiation simulator.** An external agent that plays the customer and negotiates
-  with the team. Useful as a Phase 5 evaluation layer, not as part of the company system.
 
 ## Phase 1: Separate quote, order, and fulfillment state
 
@@ -125,7 +124,8 @@ Exit criteria:
 Build three evaluation layers:
 
 1. deterministic unit and contract tests on every change;
-2. a versioned golden set covering parsing, tools, policies, and customer explanations;
+2. a versioned golden set covering parsing, tools, policies, customer explanations, and
+   negotiation scenarios grown from the existing simulator;
 3. production monitoring calibrated against human review samples.
 
 Use LLM-as-judge only for subjective communication qualities, and calibrate it against human
@@ -170,9 +170,11 @@ Exit criteria:
 
 ## Phase 7: Business optimization without unsafe autonomy
 
-A business advisor agent (deferred by design, above) can graduate from descriptive
-recommendations to constrained experiments only after the earlier controls exist. Candidate capabilities include demand forecasting, supplier scorecards,
-quote-expiry optimization, and inventory policy simulation.
+The current business advisor provides descriptive analysis and recommendations from the
+committed transaction ledger. The next step is constrained experiments where the advisor can
+propose and measure policy changes - only after the earlier controls exist. Candidate
+capabilities include demand forecasting, supplier scorecards, quote-expiry optimization, and
+inventory policy simulation.
 
 Recommendations should include evidence, expected impact, uncertainty, affected stakeholders, and
 a rollback condition. Humans remain accountable for pricing, credit, procurement, and customer

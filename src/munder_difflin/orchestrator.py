@@ -1,4 +1,4 @@
-"""Request lifecycle harness around the four-agent Pydantic AI team.
+"""Request lifecycle harness around the five-agent Pydantic AI team.
 
 The harness owns everything that must never depend on a model: database
 setup, run identity, the customer-safety guard, and assembling the final
@@ -8,6 +8,8 @@ agents own interpretation, delegation, and wording.
 
 from __future__ import annotations
 
+import unicodedata
+from collections.abc import Callable
 from datetime import date
 from decimal import Decimal
 from hashlib import sha256
@@ -30,6 +32,7 @@ from munder_difflin.models import (
     ProcessResult,
     QuoteResult,
     RequestStatus,
+    RunEvent,
 )
 
 FORBIDDEN_CUSTOMER_TERMS = (
@@ -47,6 +50,10 @@ _DEFAULT_SUMMARIES = {
         "Part of your request can be fulfilled; unavailable lines are explained below."
     ),
     RequestStatus.REJECTED: "We cannot safely fulfill this request by the required deadline.",
+    RequestStatus.NEEDS_CLARIFICATION: (
+        "We are holding this order until the questions below are answered; "
+        "nothing has been ordered or charged."
+    ),
 }
 
 _MAX_SUMMARY_LENGTH = 600
@@ -80,8 +87,16 @@ class MunderDifflinSystem:
         customer_context: str = "customer",
         event: str = "business event",
         request_id: str | None = None,
+        on_event: Callable[[RunEvent], None] | None = None,
+        clarify_first: bool = False,
     ) -> ProcessResult:
-        """Run one customer request through the agent team and package the result."""
+        """Run one customer request through the agent team and package the result.
+
+        ``on_event`` receives each structured run event the moment a tool
+        emits it, so callers can stream live progress. ``clarify_first``
+        holds all stock and ledger actions while any line is unresolved,
+        for callers (like negotiation mode) that can ask the customer.
+        """
 
         stable_id = (
             request_id or sha256(f"{request_date.isoformat()}:{request}".encode()).hexdigest()[:16]
@@ -93,6 +108,8 @@ class MunderDifflinSystem:
             trace_id=trace_id,
             request_date=request_date,
             original_request=request,
+            clarify_first=clarify_first,
+            on_event=on_event,
         )
         deps.emit("Orchestrator", "interpret_request", "started", "Reading the customer request")
 
@@ -105,7 +122,7 @@ class MunderDifflinSystem:
             prompt,
             deps=deps,
             model=self.model,
-            usage_limits=UsageLimits(request_limit=30),
+            usage_limits=UsageLimits(request_limit=self.settings.llm_request_limit),
         )
 
         self._ensure_complete(deps)
@@ -192,12 +209,25 @@ class MunderDifflinSystem:
             )
             for line in fulfillment.fulfilled_lines
         ]
+        # For clarification holds, items that are merely waiting (not genuinely declined) should
+        # not appear under "Please clarify" alongside unsupported/ambiguous items - it misleads
+        # both the customer agent and the reader. Only show lines that actually need action.
+        if fulfillment.status is RequestStatus.NEEDS_CLARIFICATION:
+            actionable_declined = [
+                line
+                for line in fulfillment.declined_lines
+                if line.reason_code != "awaiting_clarification"
+            ]
+        else:
+            actionable_declined = list(fulfillment.declined_lines)
         declined = [
             f"{line.requested_quantity:,} of {line.requested_item}: {line.customer_reason}"
-            for line in fulfillment.declined_lines
+            for line in actionable_declined
         ]
         committed_items = {line.catalog_item for line in fulfillment.fulfilled_lines}
         rationale = [line.rationale for line in quote.lines if line.catalog_item in committed_items]
+        if committed_items and quote.comparables_note:
+            rationale.append(quote.comparables_note)
         delivery_message = None
         if fulfillment.fulfilled_lines:
             latest = max(line.delivery_date for line in fulfillment.fulfilled_lines)
@@ -233,5 +263,5 @@ class MunderDifflinSystem:
 
 
 def _contains_forbidden_terms(rendered: str) -> bool:
-    lowered = rendered.lower()
-    return any(term in lowered for term in FORBIDDEN_CUSTOMER_TERMS)
+    normalized = unicodedata.normalize("NFC", rendered).lower()
+    return any(term in normalized for term in FORBIDDEN_CUSTOMER_TERMS)

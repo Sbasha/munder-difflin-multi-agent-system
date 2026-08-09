@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ import pandas as pd
 
 from munder_difflin.config import Settings
 from munder_difflin.db.helpers import generate_financial_report
-from munder_difflin.models import RequestStatus
+from munder_difflin.models import RequestStatus, RunEvent
 from munder_difflin.orchestrator import FORBIDDEN_CUSTOMER_TERMS, MunderDifflinSystem
 
 
@@ -41,14 +42,34 @@ def _hash_file(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
 
+def timestamped_output_path(base_dir: Path | None = None) -> Path:
+    """Return a fresh results location under the gitignored runs directory.
+
+    Every run gets its own folder, so experiments never overwrite the
+    committed submission artifacts; promoting a run is an explicit
+    ``--output test_results.csv``.
+    """
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return (base_dir or Path("runs")) / stamp / "test_results.csv"
+
+
 def run_evaluation(
     settings: Settings,
     output_path: Path,
     *,
     limit: int | None = None,
     seed: int = 137,
+    on_request_start: Callable[[str, str], None] | None = None,
+    on_event: Callable[[RunEvent], None] | None = None,
+    on_request_complete: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, EvaluationMetrics]:
-    """Run sample requests in date order against a fresh seeded database."""
+    """Run sample requests in date order against a fresh seeded database.
+
+    The optional callbacks report live progress: request start, every agent
+    event as it is emitted, and the recorded outcome of each request. The
+    evaluation itself stays headless; presentation belongs to the caller.
+    """
 
     sample_path = settings.data_dir / "quote_requests_sample.csv"
     requests = pd.read_csv(sample_path)
@@ -73,6 +94,8 @@ def run_evaluation(
         for _, row in requests.iterrows():
             request_date = row["request_date"].date()
             request_id = str(row["request_label"])
+            if on_request_start is not None:
+                on_request_start(request_id, request_date.isoformat())
             result = None
             last_error: Exception | None = None
             for _attempt in range(2):
@@ -83,12 +106,15 @@ def run_evaluation(
                         customer_context=str(row["job"]),
                         event=str(row["event"]),
                         request_id=request_id,
+                        on_event=on_event,
                     )
                     break
                 except Exception as error:
                     last_error = error
             if result is None:
                 records.append(_failure_record(request_id, request_date, row, error=last_error))
+                if on_request_complete is not None:
+                    on_request_complete(records[-1])
                 continue
             for event in result.events:
                 event_file.write(event.model_dump_json() + "\n")
@@ -126,6 +152,8 @@ def run_evaluation(
                     "trace_id": result.trace_id,
                 }
             )
+            if on_request_complete is not None:
+                on_request_complete(records[-1])
 
     results = pd.DataFrame(records)
     output_path.parent.mkdir(parents=True, exist_ok=True)

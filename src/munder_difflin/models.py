@@ -16,11 +16,17 @@ class StrictModel(BaseModel):
 
 
 class RequestStatus(StrEnum):
-    """Externally visible request outcomes."""
+    """Externally visible request outcomes.
+
+    ``NEEDS_CLARIFICATION`` occurs only in negotiation mode, where execution
+    is held while the customer can still answer questions; batch evaluation
+    always ends in one of the other three.
+    """
 
     FULFILLED = "fulfilled"
     PARTIAL = "partial"
     REJECTED = "rejected"
+    NEEDS_CLARIFICATION = "needs_clarification"
 
 
 class ResolutionStatus(StrEnum):
@@ -91,6 +97,7 @@ class QuoteResult(StrictModel):
     discount_total: Decimal = Field(ge=0)
     total: Decimal = Field(ge=0)
     historical_quotes_consulted: int = Field(ge=0)
+    comparables_note: str | None = None
 
 
 class FulfilledLine(StrictModel):
@@ -148,7 +155,12 @@ class CustomerResponse(StrictModel):
         if self.supplied_items:
             sections.append("Supplied: " + "; ".join(self.supplied_items) + ".")
         if self.declined_items:
-            sections.append("Not supplied: " + "; ".join(self.declined_items) + ".")
+            label = (
+                "Please clarify"
+                if self.status is RequestStatus.NEEDS_CLARIFICATION
+                else "Not supplied"
+            )
+            sections.append(f"{label}: " + "; ".join(self.declined_items) + ".")
         if self.supplied_items:
             sections.append(f"Quoted total: ${self.quoted_total:.2f}.")
         if self.pricing_rationale:
@@ -156,6 +168,25 @@ class CustomerResponse(StrictModel):
         if self.delivery_message:
             sections.append(self.delivery_message)
         return " ".join(sections)
+
+
+class AdvisoryRecommendation(StrictModel):
+    """One prioritized recommendation produced by the business advisor."""
+
+    category: str
+    priority: str
+    finding: str
+    recommendation: str
+
+
+class AdvisoryReport(StrictModel):
+    """Read-only business advisory synthesized from live transaction data."""
+
+    as_of_date: str
+    cash_balance: float
+    total_assets: float
+    recommendations: list[AdvisoryRecommendation]
+    summary: str
 
 
 class RunEvent(StrictModel):

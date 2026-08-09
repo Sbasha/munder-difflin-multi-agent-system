@@ -9,9 +9,10 @@ to run and how outcomes are worded, never what the numbers are.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -32,6 +33,8 @@ from munder_difflin.db.helpers import (
     search_quote_history,
 )
 from munder_difflin.models import (
+    AdvisoryRecommendation,
+    AdvisoryReport,
     DeclinedLine,
     FulfilledLine,
     FulfillmentResult,
@@ -39,16 +42,22 @@ from munder_difflin.models import (
     ParsedLineItem,
     QuoteResult,
     RequestStatus,
+    ResolutionStatus,
     RunEvent,
 )
-from munder_difflin.pricing import build_quote
+from munder_difflin.pricing import build_quote, compare_with_history
 
 
 class ExtractedLine(BaseModel):
     """One product line the orchestrator extracted from the raw request text."""
 
-    item_text: str = Field(description="The product exactly as the customer described it")
-    quantity: int = Field(gt=0, description="The numeric amount requested")
+    item_text: str = Field(
+        description=(
+            "The product name as the customer wrote it, without sizes, specifications, "
+            "parentheticals, or conditions, e.g. 'A4 paper', 'kraft paper envelopes'"
+        )
+    )
+    quantity: int = Field(gt=0, description="The total numeric amount requested for this line")
     unit: str = Field(description="The unit word used, e.g. sheets, reams, packs, cups")
 
 
@@ -65,16 +74,19 @@ class AgentDependencies:
     trace_id: str
     request_date: date
     original_request: str
+    clarify_first: bool = False
     deadline: date | None = None
     cash_before: Decimal | None = None
     line_items: list[ParsedLineItem] = field(default_factory=list)
     decisions: dict[str, InventoryDecision] = field(default_factory=dict)
     stock_order_ids: dict[str, int] = field(default_factory=dict)
     comparables_count: int = 0
+    comparable_totals: list[Decimal] | None = None
     quote: QuoteResult | None = None
     fulfilled_lines: list[FulfilledLine] = field(default_factory=list)
     fulfillment: FulfillmentResult | None = None
     events: list[RunEvent] = field(default_factory=list)
+    on_event: Callable[[RunEvent], None] | None = None
 
     @property
     def effective_deadline(self) -> date:
@@ -83,18 +95,19 @@ class AgentDependencies:
         return self.deadline or self.request_date
 
     def emit(self, agent: str, action: str, outcome: str, detail: str) -> None:
-        """Append one structured run event for the terminal UI and event log."""
+        """Append one structured run event and stream it to any live observer."""
 
-        self.events.append(
-            RunEvent(
-                trace_id=self.trace_id,
-                sequence=len(self.events) + 1,
-                agent=agent,
-                action=action,
-                outcome=outcome,
-                detail=detail,
-            )
+        event = RunEvent(
+            trace_id=self.trace_id,
+            sequence=len(self.events) + 1,
+            agent=agent,
+            action=action,
+            outcome=outcome,
+            detail=detail,
         )
+        self.events.append(event)
+        if self.on_event is not None:
+            self.on_event(event)
 
 
 orchestrator_agent = Agent(
@@ -113,9 +126,18 @@ orchestrator_agent = Agent(
         "internal check before committing.\n"
         "5. Call finalize_order exactly once.\n"
         "Then reply with one or two short sentences summarizing the outcome for the customer in "
-        "a warm, professional tone, briefly explaining why any line could not be supplied. Do "
-        "not repeat specific prices, quantities, or dates (an itemized statement is attached "
-        "automatically) and never mention internal finances, tooling, or errors."
+        "a warm, professional tone, briefly explaining why any line could not be supplied. If "
+        "the outcome status is needs_clarification, look at the resolution reason for each "
+        "ambiguous line and ask for exactly what is missing: if the reason mentions catalog "
+        "item names, ask the customer to confirm which named item they want (quote the names "
+        "directly); if the reason mentions a packet or box size was not specified, ask the "
+        "customer to provide the total unit count instead. Items that are merely being held "
+        "will be processed automatically once the questions are answered - do not ask the "
+        "customer to re-specify those. Do not ask for product specifications such as size, "
+        "finish, weight, closure, or window style; resolution requires only a catalog product "
+        "name, a total quantity, and a delivery date. Do not repeat specific prices, quantities, "
+        "or dates (an itemized statement is attached automatically) and never mention internal "
+        "finances, tooling, or errors."
     ),
 )
 
@@ -162,7 +184,9 @@ def build_live_model(settings: Settings) -> OpenAIChatModel:
     """Build the OpenAI-compatible model (Vocareum proxy by default)."""
 
     if not settings.llm_api_key:
-        raise ValueError("LLM_API_KEY or UDACITY_OPENAI_API_KEY is required to run the agents")
+        raise ValueError(
+            "Set UDACITY_OPENAI_API_KEY, OPENAI_API_KEY, or LLM_API_KEY to run the agents"
+        )
     return OpenAIChatModel(
         settings.llm_model,
         provider=OpenAIProvider(
@@ -235,11 +259,26 @@ async def consult_inventory(ctx: RunContext[AgentDependencies]) -> list[dict[str
     """Delegate availability and restocking to the inventory agent.
 
     Returns the authoritative inventory decisions recorded by its tools.
+    In clarify-first mode, an order with clarifiable (ambiguous) lines is
+    held: no stock or ledger action is taken until the customer has
+    answered. Unsupported products cannot be fixed by clarification, so they
+    decline normally and never hold the order on their own.
     """
 
     deps = ctx.deps
     if deps.cash_before is None:
         deps.cash_before = Decimal(str(get_cash_balance(deps.effective_deadline.isoformat())))
+    clarifiable = [
+        item for item in deps.line_items if item.resolution_status is ResolutionStatus.AMBIGUOUS
+    ]
+    if deps.clarify_first and clarifiable:
+        deps.emit(
+            "Orchestrator",
+            "clarification_hold",
+            "held",
+            f"{len(clarifiable)} line(s) can be clarified; no stock or ledger action taken",
+        )
+        return []
     resolved = [item for item in deps.line_items if item.catalog_item and item.normalized_quantity]
     if resolved:
         prompt = (
@@ -270,6 +309,7 @@ async def request_quote(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
             [(decision.catalog_item, decision.requested_quantity) for decision in deliverable],
             markup_rate=deps.settings.markup_rate,
             historical_quotes_consulted=deps.comparables_count,
+            comparable_totals=deps.comparable_totals,
         )
     return deps.quote.model_dump(mode="json")
 
@@ -531,6 +571,16 @@ def retrieve_comparable_quotes(
     deps = ctx.deps
     rows = search_quote_history(search_terms, limit)
     deps.comparables_count = len(rows)
+    totals: list[Decimal] = []
+    for row in rows:
+        value = row.get("total_amount")
+        if value is None:
+            continue
+        try:
+            totals.append(Decimal(str(value)))
+        except InvalidOperation:
+            continue
+    deps.comparable_totals = totals
     deps.emit(
         "Quoting",
         "retrieve_comparable_quotes",
@@ -563,6 +613,7 @@ def compute_quote(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
         deliverable,
         markup_rate=deps.settings.markup_rate,
         historical_quotes_consulted=deps.comparables_count,
+        comparable_totals=deps.comparable_totals,
     )
     deps.emit(
         "Quoting",
@@ -570,6 +621,9 @@ def compute_quote(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
         "completed",
         f"{len(deps.quote.lines)} priced lines totaling ${deps.quote.total:.2f}",
     )
+    if deps.comparable_totals is not None:
+        outcome, note = compare_with_history(deps.quote.total, deps.comparable_totals)
+        deps.emit("Quoting", "comparables_check", outcome, note)
     return deps.quote.model_dump(mode="json")
 
 
@@ -649,6 +703,12 @@ def commit_sale(ctx: RunContext[AgentDependencies], item_name: str) -> dict[str,
 def assemble_fulfillment(deps: AgentDependencies) -> FulfillmentResult:
     """Assemble the authoritative order outcome from recorded tool state."""
 
+    if deps.fulfillment is not None:
+        return deps.fulfillment
+
+    held_for_clarification = deps.clarify_first and any(
+        item.resolution_status is ResolutionStatus.AMBIGUOUS for item in deps.line_items
+    )
     declined: list[DeclinedLine] = []
     for item in deps.line_items:
         if not item.catalog_item or not item.normalized_quantity:
@@ -662,12 +722,18 @@ def assemble_fulfillment(deps: AgentDependencies) -> FulfillmentResult:
                 )
             )
         elif item.catalog_item not in deps.decisions:
+            if held_for_clarification:
+                reason_code = "awaiting_clarification"
+                customer_reason = "Held pending resolution of other items in this order"
+            else:
+                reason_code = "not_assessed"
+                customer_reason = "Availability could not be confirmed for this line"
             declined.append(
                 DeclinedLine(
                     requested_item=item.requested_item,
                     requested_quantity=item.requested_quantity,
-                    reason_code="not_assessed",
-                    customer_reason="Availability could not be confirmed for this line",
+                    reason_code=reason_code,
+                    customer_reason=customer_reason,
                 )
             )
 
@@ -693,13 +759,16 @@ def assemble_fulfillment(deps: AgentDependencies) -> FulfillmentResult:
             )
         )
 
-    status = (
-        RequestStatus.FULFILLED
-        if deps.fulfilled_lines and not declined
-        else RequestStatus.PARTIAL
-        if deps.fulfilled_lines
-        else RequestStatus.REJECTED
-    )
+    if held_for_clarification and not deps.fulfilled_lines:
+        status = RequestStatus.NEEDS_CLARIFICATION
+    else:
+        status = (
+            RequestStatus.FULFILLED
+            if deps.fulfilled_lines and not declined
+            else RequestStatus.PARTIAL
+            if deps.fulfilled_lines
+            else RequestStatus.REJECTED
+        )
     total = Decimal("0")
     if deps.quote is not None:
         total = sum(
@@ -716,3 +785,151 @@ def assemble_fulfillment(deps: AgentDependencies) -> FulfillmentResult:
         cash_before=cash_before,
         cash_after=cash_after,
     )
+
+
+# --- Business advisor agent ---------------------------------------------------
+
+
+@dataclass
+class AdvisorDependencies:
+    """Read-only context for the business advisor agent."""
+
+    settings: Settings
+    as_of_date: str
+
+
+advisor_agent = Agent(
+    deps_type=AdvisorDependencies,
+    output_type=AdvisoryReport,
+    retries=2,
+    instructions=(
+        "You are the business advisor for Munder Difflin, a paper company. Your role is "
+        "read-only: you analyze committed transaction data and produce actionable "
+        "recommendations to improve operational efficiency and revenue. You never place "
+        "orders or modify any records. Call your tools in this order:\n"
+        "1. Call read_financial_report once to understand the current cash and inventory state.\n"
+        "2. Call analyze_stock_gaps once to identify catalog items with demand but low or zero "
+        "stock.\n"
+        "3. Call review_demand_patterns once to find recurring demand the catalog does not "
+        "currently cover.\n"
+        "Synthesize your findings into 3 to 5 specific, prioritized recommendations. Each "
+        "recommendation must name the specific catalog items or patterns it targets and "
+        "quantify the expected impact where the data supports it. Avoid generic advice. "
+        "Assign priority 'high' for issues that directly limit revenue or create cash risk, "
+        "'medium' for operational improvements, and 'low' for longer-term opportunities."
+    ),
+)
+
+
+@advisor_agent.tool
+def read_financial_report(ctx: RunContext[AdvisorDependencies]) -> dict[str, Any]:
+    """Retrieve cash balance, inventory valuation, and top-selling products."""
+
+    report = generate_financial_report(ctx.deps.as_of_date)
+    zero_stock = [
+        item["item_name"]
+        for item in report["inventory_summary"]
+        if item["stock"] <= 0
+    ]
+    low_stock = [
+        {"item": item["item_name"], "stock": item["stock"]}
+        for item in report["inventory_summary"]
+        if 0 < item["stock"] < 100
+    ]
+    return {
+        "as_of_date": report["as_of_date"],
+        "cash_balance": report["cash_balance"],
+        "inventory_value": report["inventory_value"],
+        "total_assets": report["total_assets"],
+        "top_selling_products": report["top_selling_products"],
+        "zero_stock_items": zero_stock,
+        "low_stock_items": low_stock,
+        "zero_stock_count": len(zero_stock),
+    }
+
+
+@advisor_agent.tool
+def analyze_stock_gaps(ctx: RunContext[AdvisorDependencies]) -> dict[str, Any]:
+    """Identify catalog items that received recent demand but have no or low stock.
+
+    Compares the items in historic quote requests against current inventory
+    to surface pre-stocking opportunities.
+    """
+
+    report = generate_financial_report(ctx.deps.as_of_date)
+    stock_by_item = {item["item_name"]: item["stock"] for item in report["inventory_summary"]}
+    top_sellers = {row["item_name"] for row in report["top_selling_products"]}
+
+    gaps = []
+    for item_name, stock in stock_by_item.items():
+        if stock <= 0 and item_name in top_sellers:
+            gaps.append({"item": item_name, "stock": stock, "gap_type": "sold_out_with_demand"})
+        elif stock <= 0:
+            gaps.append({"item": item_name, "stock": stock, "gap_type": "zero_stock"})
+
+    # Items that sell well but have low buffer
+    low_buffer = [
+        {"item": row["item_name"], "stock": stock_by_item.get(row["item_name"], 0),
+         "total_units_sold": row["total_units"]}
+        for row in report["top_selling_products"]
+        if stock_by_item.get(row["item_name"], 0) < row["total_units"]
+    ]
+
+    return {
+        "stock_gaps": gaps[:10],
+        "low_buffer_vs_demand": low_buffer,
+        "total_zero_stock": sum(1 for g in gaps if g["stock"] <= 0),
+    }
+
+
+@advisor_agent.tool
+def review_demand_patterns(
+    ctx: RunContext[AdvisorDependencies],
+    search_terms: list[str] | None = None,
+) -> dict[str, Any]:
+    """Review historical quote request patterns to find recurring demand themes.
+
+    Searches quote history for the most common product categories and event
+    types to identify seasonal patterns and catalog gaps.
+    """
+
+    terms = search_terms or ["paper", "envelopes", "cardstock", "poster", "recycled"]
+    rows = search_quote_history(terms, limit=10)
+    event_types: dict[str, int] = {}
+    job_types: dict[str, int] = {}
+    for row in rows:
+        et = str(row.get("event_type") or "unknown")
+        jt = str(row.get("job_type") or "unknown")
+        event_types[et] = event_types.get(et, 0) + 1
+        job_types[jt] = job_types.get(jt, 0) + 1
+
+    top_events = sorted(event_types.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_jobs = sorted(job_types.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return {
+        "comparable_quotes_reviewed": len(rows),
+        "top_event_types": [{"event": e, "count": c} for e, c in top_events],
+        "top_customer_roles": [{"role": j, "count": c} for j, c in top_jobs],
+        "sample_requests": [
+            str(row.get("original_request", ""))[:120] for row in rows[:3]
+        ],
+    }
+
+
+def run_advisory(
+    settings: Settings,
+    as_of_date: str,
+    model: "OpenAIChatModel | None" = None,
+) -> AdvisoryReport:
+    """Run the business advisor agent against committed transaction data."""
+
+    from munder_difflin.orchestrator import MunderDifflinSystem
+
+    deps = AdvisorDependencies(settings=settings, as_of_date=as_of_date)
+    live_model = model or MunderDifflinSystem(settings).model
+    result = advisor_agent.run_sync(
+        f"Analyze the business state as of {as_of_date} and produce your recommendations.",
+        deps=deps,
+        model=live_model,
+    )
+    return result.output

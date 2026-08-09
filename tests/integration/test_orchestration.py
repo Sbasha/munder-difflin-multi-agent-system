@@ -20,6 +20,8 @@ def _run(
     quoting_script=None,
     fulfillment_script=None,
     final_text: str = "Thanks for your order.",
+    on_event=None,
+    clarify_first: bool = False,
 ) -> ProcessResult:
     system = MunderDifflinSystem(settings)
     system.initialize()
@@ -41,6 +43,8 @@ def _run(
             request,
             request_date=date(2025, 4, 1),
             request_id=request_id,
+            on_event=on_event,
+            clarify_first=clarify_first,
         )
 
 
@@ -185,6 +189,129 @@ def test_incomplete_run_fails_safe_without_charges(settings: Settings, scripted_
     assert result.fulfillment.cash_delta == 0
     assert result.fulfillment.declined_lines[0].reason_code == "not_assessed"
     assert any(event.action == "finalize_backstop" for event in result.events)
+
+
+def test_clarify_first_holds_all_side_effects_for_ambiguous_lines(
+    settings: Settings, scripted_model
+) -> None:
+    result = _run(
+        settings,
+        scripted_model,
+        "I need 200 sheets of A4 paper and 5 packs of glossy paper by April 15, 2025.",
+        orchestrator_script=[
+            (
+                "resolve_catalog_items",
+                {
+                    "lines": [
+                        {"item_text": "A4 paper", "quantity": 200, "unit": "sheets"},
+                        {"item_text": "glossy paper", "quantity": 5, "unit": "packs"},
+                    ],
+                    "deadline": "2025-04-15",
+                },
+            ),
+            ("consult_inventory", {}),
+            ("request_quote", {}),
+            ("finalize_order", {}),
+        ],
+        request_id="integration-clarify-hold",
+        clarify_first=True,
+    )
+
+    assert result.fulfillment.status is RequestStatus.NEEDS_CLARIFICATION
+    assert result.fulfillment.cash_delta == 0
+    assert not result.fulfillment.fulfilled_lines
+    codes = {line.reason_code for line in result.fulfillment.declined_lines}
+    assert codes == {"ambiguous", "awaiting_clarification"}
+    actions = {event.action for event in result.events}
+    assert "clarification_hold" in actions
+    assert actions.isdisjoint({"place_restock_order", "commit_sale"})
+    rendered = result.customer_response.render()
+    assert "Please clarify:" in rendered
+    # The awaiting_clarification item (A4 paper, just held) must NOT appear in the
+    # customer-facing "Please clarify" list - it misleads the customer into thinking
+    # their A4 paper order is being questioned. Only the genuinely ambiguous line
+    # (packs of glossy paper) should prompt the customer to clarify.
+    assert "pending resolution" not in rendered.lower()
+    assert "glossy paper" in rendered.lower()
+
+
+def test_clarify_first_still_executes_when_nothing_is_clarifiable(
+    settings: Settings, scripted_model
+) -> None:
+    result = _run(
+        settings,
+        scripted_model,
+        "I need 200 sheets of A4 paper and 100 balloons delivered by April 15, 2025.",
+        orchestrator_script=[
+            (
+                "resolve_catalog_items",
+                {
+                    "lines": [
+                        {"item_text": "A4 paper", "quantity": 200, "unit": "sheets"},
+                        {"item_text": "balloons", "quantity": 100, "unit": "balloons"},
+                    ],
+                    "deadline": "2025-04-15",
+                },
+            ),
+            ("consult_inventory", {}),
+            ("request_quote", {}),
+            ("finalize_order", {}),
+        ],
+        request_id="integration-clarify-executes",
+        inventory_script=[
+            ("inventory_snapshot", {}),
+            ("assess_availability", {"item_name": "A4 paper"}),
+        ],
+        quoting_script=[
+            ("retrieve_comparable_quotes", {"search_terms": ["A4 paper"]}),
+            ("compute_quote", {}),
+        ],
+        fulfillment_script=[("commit_sale", {"item_name": "A4 paper"})],
+        clarify_first=True,
+    )
+
+    assert result.fulfillment.status is RequestStatus.PARTIAL
+    assert len(result.fulfillment.fulfilled_lines) == 1
+    assert result.fulfillment.declined_lines[0].reason_code == "unsupported"
+
+
+def test_events_stream_to_the_callback_as_the_run_progresses(
+    settings: Settings, scripted_model
+) -> None:
+    streamed = []
+    result = _run(
+        settings,
+        scripted_model,
+        "Please send 200 sheets of colored paper by April 15, 2025.",
+        orchestrator_script=[
+            (
+                "resolve_catalog_items",
+                {
+                    "lines": [{"item_text": "colored paper", "quantity": 200, "unit": "sheets"}],
+                    "deadline": "2025-04-15",
+                },
+            ),
+            ("consult_inventory", {}),
+            ("request_quote", {}),
+            ("finalize_order", {}),
+        ],
+        request_id="integration-stream",
+        inventory_script=[
+            ("inventory_snapshot", {}),
+            ("assess_availability", {"item_name": "Colored paper"}),
+            ("place_restock_order", {"item_name": "Colored paper"}),
+        ],
+        quoting_script=[
+            ("retrieve_comparable_quotes", {"search_terms": ["Colored paper"]}),
+            ("compute_quote", {}),
+        ],
+        fulfillment_script=[("commit_sale", {"item_name": "Colored paper"})],
+        on_event=streamed.append,
+    )
+
+    assert streamed == result.events
+    assert [event.sequence for event in streamed] == list(range(1, len(streamed) + 1))
+    assert any(event.action == "comparables_check" for event in streamed)
 
 
 def test_leaky_model_summary_is_replaced_by_safe_default(

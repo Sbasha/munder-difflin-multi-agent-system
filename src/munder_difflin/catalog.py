@@ -243,10 +243,14 @@ def _resolve_item(item_text: str, unit: str) -> tuple[ResolutionStatus, str | No
     )
     if scored and scored[0][0] >= 0.86:
         return ResolutionStatus.RESOLVED, scored[0][1], None
+    suggestions = list(
+        dict.fromkeys(canonical for score, canonical in scored[:6] if score >= 0.55)
+    )[:3]
+    suggestion_text = f"; nearest items we carry: {', '.join(suggestions)}" if suggestions else ""
     return (
         ResolutionStatus.AMBIGUOUS,
         None,
-        f"'{candidate}' could not be matched to one catalog item without guessing",
+        f"This item could not be matched to one catalog item{suggestion_text}",
     )
 
 
@@ -261,7 +265,10 @@ def _normalize_quantity(
             return quantity * 500, None
         return None, "Reams are only supported for sheet-based paper products"
     if normalized_unit in {"pack", "packs", "packet", "packets", "box", "boxes"}:
-        return None, f"The quantity contained in each {normalized_unit} was not specified"
+        singular = {"packs": "pack", "packets": "packet", "boxes": "box"}.get(
+            normalized_unit, normalized_unit
+        )
+        return None, f"The quantity contained in each {singular} was not specified"
     return quantity, None
 
 
@@ -282,7 +289,7 @@ def resolve_requested_line(
     if unit_reason:
         status = ResolutionStatus.AMBIGUOUS
         catalog_item = None
-        reason = unit_reason
+        reason = f"{unit_reason}; {reason}" if reason else unit_reason
     return ParsedLineItem(
         raw_text=f"{quantity} {unit} {item_text}".strip(),
         requested_quantity=quantity,

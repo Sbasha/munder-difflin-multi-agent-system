@@ -5,12 +5,13 @@ title: Munder Difflin agent workflow
 flowchart TB
     subgraph user["CUSTOMER"]
         request["Customer request<br>items · quantities · deadline"]:::inputOutput
+        negotiator["<b>Customer Agent</b> · negotiation mode<br>reads only the customer-safe response;<br>accepts, revises, or walks away"]:::llm
     end
 
     subgraph system["MULTI-AGENT SYSTEM"]
         subgraph orchestration["ORCHESTRATION"]
             orchestrator["<b>1 · Orchestrator Agent</b><br>Interprets the request, delegates the work,<br>and composes the customer response"]:::llm
-            orchestrator_tools["<b>Orchestrator tools</b><br><br><b>resolve_catalog_items</b> · catalog matching<br><i>aliases · units · fuzzy threshold</i><br><br><b>financial_health_report</b> · internal check<br><i>generate_financial_report</i>"]:::tool
+            orchestrator_tools["<b>Orchestrator tools</b><br><br><b>resolve_catalog_items</b> · catalog matching<br><i>aliases · units · fuzzy threshold</i><br><br><b>consult_inventory</b> · delegate availability<br><i>get_cash_balance · cash baseline</i><br><br><b>request_quote</b> · delegate pricing<br><br><b>finalize_order</b> · delegate commitment,<br>assemble the outcome<br><br><b>financial_health_report</b> · internal check, quotes over $500<br><i>generate_financial_report</i>"]:::tool
             orchestrator --> orchestrator_tools
         end
 
@@ -33,7 +34,7 @@ flowchart TB
             full["FULL<br>all lines supplied"]:::success
             partial["PARTIAL<br>declined lines explained"]:::warning
             rejected["REJECTED<br>reason provided"]:::error
-            response["Orchestrator composes the<br>customer-safe response"]:::llm
+            response["Orchestrator words the summary;<br>a deterministic guard assembles<br>the customer-safe response"]:::llm
             decision --> full --> response
             decision --> partial --> response
             decision --> rejected --> response
@@ -45,11 +46,14 @@ flowchart TB
     end
 
     request -->|"1 · Send request"| orchestrator
-    orchestrator -->|"2 · Resolved lines"| inventory
-    orchestrator -->|"3 · Deliverable lines"| quoting
-    orchestrator -->|"4 · Priced lines"| fulfillment
+    orchestrator -->|"2 · consult_inventory<br>resolved lines"| inventory
+    orchestrator -->|"3 · request_quote<br>deliverable lines"| quoting
+    orchestrator -->|"4 · finalize_order<br>lines to commit"| fulfillment
     fulfillment -->|"5 · Fulfillment result"| decision
     response -->|"6 · Customer response"| request
+
+    response -. "customer-safe text" .-> negotiator
+    negotiator -. "revised request" .-> request
 
     orchestrator_tools --> ledger
     inventory_tools --> ledger
